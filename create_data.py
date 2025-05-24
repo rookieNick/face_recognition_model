@@ -38,7 +38,7 @@ CONFIG = {
         'path': "models/glint360k_r50.onnx",  # Path to the face recognition model
         'detection_size': (640, 640),  # Input size for face detection
         'recognition_size': (112, 112),  # Optimized input size for glint360k model
-        'detection_threshold': 0.8,  # Minimum confidence for face detection
+        'detection_threshold': 0.7,  # Minimum confidence for face detection
         'face_confidence_threshold': 0.7,  # Minimum confidence for face quality
     },
     'collection': {

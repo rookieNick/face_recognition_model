@@ -160,7 +160,7 @@ def process_face(face, frame, known_embeddings):
         print("-" * 30)
 
         return {
-            'last_recognized': best_match if best_similarity >= CONFIG['recognition']['min_similarity'] else "Unknown",  # Return best match if above threshold
+            'recognized_identity': best_match if best_similarity >= CONFIG['recognition']['min_similarity'] else "Unknown",  # Return best match if above threshold
             'bbox': (x1, y1, w, h),  # Return bounding box
             'similarity': best_similarity  # Return similarity percentage
         }
@@ -219,7 +219,7 @@ def draw_recognition_results(display_image, result):
         result: Recognition result dictionary
     """
     x, y, w, h = result['bbox']  # Get bounding box
-    label = result['last_recognized']  # Get recognized label
+    label = result['recognized_identity']  # Get recognized label
     similarity = result['similarity']  # Get similarity percentage
     
     color = (0, 255, 0) if label not in ["Unknown", "Error"] else (0, 0, 255)  # Green for recognized, red for unknown
