@@ -22,7 +22,7 @@ import insightface  # Main face analysis library
 from insightface.app import FaceAnalysis  # Face detection and analysis
 from insightface.model_zoo.arcface_onnx import ArcFaceONNX  # Face embedding model
 from insightface.utils.face_align import norm_crop  # Face alignment utility
-
+from models.DeepFaceModel.FasNet import Fasnet
 # Configuration constants - centralized settings for easy modification
 CONFIG = {
     'directories': {
@@ -60,6 +60,8 @@ app.prepare(ctx_id=0, det_size=CONFIG['model']['detection_size'],  # Prepare det
            det_thresh=CONFIG['model']['detection_threshold'])
 model = ArcFaceONNX(CONFIG['model']['path'])  # Create face embedding model
 model.prepare(ctx_id=0)  # Prepare embedding model
+# Initialize the Fasnet model for spoofing detection
+fasnet_model = Fasnet()
 
 def normalize_embedding(embedding):
     """Normalize embedding vector to unit length"""
@@ -94,13 +96,48 @@ def load_embeddings():
     print(f"✅ Loaded {len(embeddings)} face embeddings")  # Show number of loaded embeddings
     return embeddings
 
-def process_face(face, frame, known_embeddings):
+def detect_spoofing(face_img, bbox=None):
+    """
+    Detect if the face is real or a spoof attempt using Fasnet model
+    
+    Args:
+        face_img: Cropped face image (numpy array)
+        bbox: Optional bounding box (x, y, w, h) if face_img is a full frame
+    
+    Returns:
+        tuple: (is_real, confidence) where is_real is a boolean and confidence is a float 0-1
+    """
+    try:
+        # If bbox is provided, analyze the face in the full frame
+        if bbox is not None:
+            x, y, w, h = bbox
+            is_real, confidence = fasnet_model.analyze(face_img, (x, y, w, h))
+        else:
+            # If no bbox, assume face_img is already cropped
+            is_real, confidence = fasnet_model.analyze(face_img, (0, 0, face_img.shape[1], face_img.shape[0]))
+        
+        # # Print detailed spoof check results
+        # status = "REAL" if is_real else "FAKE"
+        # print(f"\n=== Anti-Spoofing Result ===")
+        # print(f"Status: {status}")
+        # print(f"Confidence: {confidence*100:.1f}%")
+        # print("==========================\n")
+        
+        return is_real, confidence
+        
+    except Exception as e:
+        print(f"⚠️ Spoof detection error: {str(e)}")
+        return False, 0.0
+
+
+def process_face(face, frame, known_embeddings, face_index):
     """
     Process a single detected face
     Args:
         face: Detected face object from InsightFace
         frame: Input video frame
         known_embeddings: Dictionary of known face embeddings
+        face_index: Index of the face in the current frame (1-based)
     Returns:
         dict: Recognition results for the face
     """
@@ -120,6 +157,19 @@ def process_face(face, frame, known_embeddings):
             aligned_face = norm_crop(frame, landmark=face.kps)  # Align and crop face
             # Resize to optimized input size for glint360k model
             aligned_face = cv2.resize(aligned_face, CONFIG['model']['recognition_size'])
+
+            # Add spoofing check here
+            is_real, spoof_confidence = detect_spoofing(aligned_face)
+            if not is_real:
+                print(f"⚠️ Spoofing attempt detected! (Confidence: {spoof_confidence*100:.1f}%)")
+                # Return spoof result with bounding box
+                return {
+                    'bbox': (x1, y1, w, h),
+                    'recognized_identity': 'Spoof Detected',
+                    'similarity': spoof_confidence * 100,
+                    'is_spoof': True
+                }
+
         except Exception as e:
             print(f"❌ Failed to align face: {e}")  # Handle alignment error
             return None
@@ -132,8 +182,8 @@ def process_face(face, frame, known_embeddings):
         best_match = None  # Initialize best match
         best_distance = float('inf')  # Initialize best distance
         best_similarity = 0  # Initialize best similarity
-
-        print(f"\nProcessing Face {face.face_id if hasattr(face, 'face_id') else 1}:")
+        
+        print(f"\nProcessing Face {face_index}:")
         print(f"Comparing with {len(known_embeddings)} stored embeddings...")
 
         for ic, known_embedding in known_embeddings.items():  # Compare with each known face
@@ -148,12 +198,12 @@ def process_face(face, frame, known_embeddings):
 
         # Print recognition result
         if best_similarity >= CONFIG['recognition']['min_similarity']:
-            print(f"\n✅ Face {face.face_id if hasattr(face, 'face_id') else 1} Recognized!")
+            print(f"\n✅ Face {face_index} Recognized!")
             print(f"IC: {best_match}")
             print(f"Similarity: {best_similarity:.2f}%")
             print(f"Distance: {best_distance:.4f}")
         else:
-            print(f"\n❌ Face {face.face_id if hasattr(face, 'face_id') else 1} Unknown")
+            print(f"\n❌ Face {face_index} Unknown")
             print(f"Best Match Similarity: {best_similarity:.2f}%")
             print(f"Distance: {best_distance:.4f}")
             print(f"Minimum Required Similarity: {CONFIG['recognition']['min_similarity']}%")
@@ -181,11 +231,12 @@ def process_frame(frame, known_embeddings, current_time):
         with state['recognition_lock']:  # Thread-safe access to results
             state['recognition_results'].clear()  # Clear previous results
 
-        for face in faces:  # Process each detected face
+        # Process each face in the current frame
+        for i, face in enumerate(faces, 1):  # Start counting from 1
             if face.det_score < CONFIG['model']['face_confidence_threshold']:  # Check confidence
                 continue
 
-            result = process_face(face, frame, known_embeddings)  # Process face
+            result = process_face(face, frame, known_embeddings, i)  # Process face with current index
             if result:  # If processing successful
                 face_key = f"{result['bbox'][0]}_{result['bbox'][1]}_{result['bbox'][2]}_{result['bbox'][3]}"  # Create unique key
                 state['recognition_results'][face_key] = result  # Store results
@@ -220,14 +271,25 @@ def draw_recognition_results(display_image, result):
     """
     x, y, w, h = result['bbox']  # Get bounding box
     label = result['recognized_identity']  # Get recognized label
-    similarity = result['similarity']  # Get similarity percentage
+    confidence = result.get('similarity', 0)  # Get confidence score
+    is_spoof = result.get('is_spoof', False)  # Check if this is a spoof attempt
     
-    color = (0, 255, 0) if label not in ["Unknown", "Error"] else (0, 0, 255)  # Green for recognized, red for unknown
-    text = f"{label} ({similarity:.1f}%)" if label not in ["Unknown", "Error"] else label  # Format text
+    # Set color and label based on status
+    if is_spoof:
+        color = (0, 0, 255)  # Red for spoof attempts
+        text = f"Spoof Detected! ({confidence:.1f}%)"
+    elif label in ["Unknown", "Error"]:
+        color = (0, 0, 255)  # Red for unknown/error
+        text = label
+    else:
+        color = (0, 255, 0)  # Green for recognized faces
+        text = f"{label} ({confidence:.1f}%)"
     
-    cv2.rectangle(display_image, (x, y), (x + w, y + h), color, 2)  # Draw rectangle
-    cv2.putText(display_image, text, (x, y - 10),  # Draw text
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+    # Draw bounding box
+    cv2.rectangle(display_image, (x, y), (x + w, y + h), color, 2)
+    
+    # Draw label with confidence
+    cv2.putText(display_image, text, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
 def display_status(display_image):
     """
@@ -298,8 +360,12 @@ def recognize_face():
 
             # Draw recognition results
             with state['recognition_lock']:  # Thread-safe access to results
-                for face_key, result in state['recognition_results'].items():  # Process each result
-                    draw_recognition_results(display_image, result)  # Draw results
+                # Create a copy of items to avoid dictionary changed size during iteration
+                results_to_draw = list(state['recognition_results'].items())
+                
+            # Draw results outside the lock to minimize lock time
+            for face_key, result in results_to_draw:
+                draw_recognition_results(display_image, result)  # Draw results
 
             display_status(display_image)  # Show status
             cv2.imshow('Face Recognition', display_image)  # Show frame
