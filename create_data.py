@@ -27,6 +27,7 @@ import insightface  # Main face analysis library
 from insightface.app import FaceAnalysis  # Face detection and analysis
 from insightface.model_zoo.arcface_onnx import ArcFaceONNX  # Face embedding model
 from insightface.utils.face_align import norm_crop  # Face alignment utility
+from models.DeepFaceModel.FasNet import Fasnet  # Add anti-spoofing import
 
 # Configuration constants - centralized settings for easy modification
 CONFIG = {
@@ -68,11 +69,34 @@ app.prepare(ctx_id=0, det_size=CONFIG['model']['detection_size'],  # Prepare det
 model = ArcFaceONNX(CONFIG['model']['path'])  # Create face embedding model
 model.prepare(ctx_id=0)  # Prepare embedding model
 
+# Initialize the Fasnet model for spoofing detection
+fasnet_model = Fasnet()
+
 def setup_directories():
     """Create necessary directories if they don't exist"""
-    for directory in CONFIG['directories'].values():  # Iterate through all directories
-        if not os.path.exists(directory):  # Check if directory exists
-            os.makedirs(directory)  # Create directory if it doesn't exist
+    for directory in CONFIG['directories'].values():
+        os.makedirs(directory, exist_ok=True)
+        print(f"Created directory: {directory}")
+
+def detect_spoofing(face_img, bbox=None):
+    """
+    Detect face spoofing attempts using Fasnet model
+    
+    Args:
+        face_img: Cropped face image (numpy array)
+        bbox: Optional bounding box (x, y, w, h) if face_img is a full frame
+    
+    Returns:
+        tuple: (is_real, confidence) where is_real is boolean, confidence 0-1
+    """
+    try:
+        if bbox is not None:
+            x, y, w, h = bbox
+            return fasnet_model.analyze(face_img, (x, y, w, h))
+        return fasnet_model.analyze(face_img, (0, 0, *face_img.shape[:2]))
+    except Exception as e:
+        print(f"⚠️ Spoof detection error: {str(e)}")
+        return True, 0.0  # Fail-safe: allow collection on error
 
 def normalize_embedding(embedding):
     """
@@ -110,13 +134,19 @@ def process_face(face, frame):
     # Resize to optimized input size for glint360k model
     face_img = cv2.resize(face_img, CONFIG['model']['recognition_size'])
 
+    # Detect spoofing
+    is_real, spoof_confidence = detect_spoofing(face_img, (x1_p, y1_p, x2_p - x1_p, y2_p - y1_p))
+    if not is_real:
+        print(f"⚠️ Spoofing attempt detected! (Confidence: {spoof_confidence*100:.1f}%)")
+
     # Generate embedding
     embedding = model.get_feat(face_img)  # Get face embedding
     embedding = embedding.flatten().tolist()  # Convert to 1D list
     
     return {
         'bbox': (x1, y1, w, h),  # Return bounding box
-        'is_real': True,  # Flag for real face
+        'is_real': is_real,  # Flag for real face
+        'spoof_confidence': spoof_confidence,  # Spoof confidence
         'embedding': embedding,  # Face embedding
         'face_img': face_img  # Aligned face image
     }
@@ -171,20 +201,25 @@ def detection_worker():
             print(f"Worker thread error: {str(e)}")  # Handle worker errors
             time.sleep(0.1)  # Delay on error
 
-def draw_detection_results(display_image, result):
+def draw_detection_results(frame, result):
     """
-    Draw detection results on the display image
+    Draw face detection and spoof results on frame
     Args:
-        display_image: Image to draw on
+        frame: Input video frame
         result: Detection result dictionary
     """
-    x, y, w, h = result['bbox']  # Get bounding box
-    is_real = result['is_real']  # Get face status
+    x, y, w, h = result['bbox']
     
-    color = (0, 255, 0) if is_real else (0, 0, 255)  # Green for real, red for fake
-    label = "Real" if is_real else "Fake"  # Set label text
-    cv2.rectangle(display_image, (x, y), (x + w, y + h), color, 2)  # Draw rectangle
-    cv2.putText(display_image, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)  # Draw label
+    # Draw face rectangle with color based on spoof status
+    color = (0, 255, 0) if result.get('is_real', True) else (0, 0, 255)
+    cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+    
+    # Add spoof confidence text if available
+    status = "REAL" if result['is_real'] else "FAKE"
+    text = f"{status}: {result['spoof_confidence']*100:.1f}%"
+    cv2.putText(frame, text, (x, y - 10), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
 
 def display_status(display_image, ic, count):
     """
@@ -282,6 +317,7 @@ def create_data(ic):
                 for face_key, result in state['detection_results'].items():  # Process each result
                     draw_detection_results(display_image, result)  # Draw results
 
+                    # Only proceed with real faces
                     if result['is_real'] and count <= CONFIG['collection']['required_images'] and 'embedding' in result:
                         temp_path2 = f"{CONFIG['directories']['datasets']}/temp2_{count}.jpg"  # Create temp file path
                         # cv2.imwrite(temp_path2, result['face_img'])  # Save face image
